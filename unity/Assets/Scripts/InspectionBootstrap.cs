@@ -34,8 +34,16 @@ namespace Inspection
             camera.farClipPlane = 100f;
             camera.clearFlags = CameraClearFlags.SolidColor;
             camera.backgroundColor = Color.black;
-            cameraObject.AddComponent<ARCameraManager>();
+            var cameraManager = cameraObject.AddComponent<ARCameraManager>();
             cameraObject.AddComponent<ARCameraBackground>();
+            var occlusion = cameraObject.AddComponent<AROcclusionManager>();
+            occlusion.requestedEnvironmentDepthMode = EnvironmentDepthMode.Fastest;
+            occlusion.environmentDepthTemporalSmoothingRequested = true;
+            // Request depth data for hit-testing without changing the marker's rendering/occlusion.
+            occlusion.requestedOcclusionPreferenceMode = OcclusionPreferenceMode.NoOcclusion;
+            var depth = cameraObject.AddComponent<DepthAvailability>();
+            depth.occlusion = occlusion;
+            depth.cameraManager = cameraManager;
             var tracking = cameraObject.AddComponent<TrackedPoseDriver>();
             tracking.SetPoseSource(TrackedPoseDriver.DeviceType.GenericXRDevice, TrackedPoseDriver.TrackedPose.Center);
             origin.Camera = camera;
@@ -51,6 +59,7 @@ namespace Inspection
             placement.planes = planes;
             placement.raycasts = raycasts;
             placement.anchors = anchors;
+            placement.depth = depth;
             originObject.SetActive(true);
 
             var eventSystem = new GameObject("EventSystem");

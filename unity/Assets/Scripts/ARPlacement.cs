@@ -12,25 +12,35 @@ namespace Inspection
         public ARRaycastManager raycasts;
         public ARPlaneManager planes;
         public ARAnchorManager anchors;
+        public DepthAvailability depth;
         public bool IsSubmitting { get; set; }
         public bool HasMarker => marker != null && markerAnchor != null;
         public bool IsCreatingAnchor { get; private set; }
         public Vector3 Position => markerAnchor != null ? markerAnchor.transform.position : Vector3.zero;
         public Vector2 AimScreenPoint { get; private set; }
-        public bool CanConfirm => !IsSubmitting && !IsCreatingAnchor && ValidPlane(candidatePlane)
+        public bool CanConfirm => !IsSubmitting && !IsCreatingAnchor && CandidateUsable(candidate)
             && ARSession.state == ARSessionState.SessionTracking && stability.IsReady(Time.unscaledTime);
         public bool CanSubmit => HasMarker && !IsCreatingAnchor
             && markerAnchor.trackingState == TrackingState.Tracking && ARSession.state == ARSessionState.SessionTracking;
         public string Hint { get; private set; } = "Scan a floor, table or wall.";
         public Color PreviewColor { get; private set; } = Color.gray;
 
-        readonly List<ARRaycastHit> hits = new List<ARRaycastHit>();
+        readonly List<ARRaycastHit> planeHits = new List<ARRaycastHit>();
+        readonly List<ARRaycastHit> depthHits = new List<ARRaycastHit>();
         readonly List<RaycastResult> uiHits = new List<RaycastResult>();
         readonly PlacementStability stability = new PlacementStability();
         GameObject marker, preview;
         Material markerMaterial, previewMaterial;
         ARAnchor markerAnchor;
-        ARPlane candidatePlane;
+        struct Candidate
+        {
+            public SurfaceDecision decision;
+            public ARPlane plane;
+            public TrackableId key;
+        }
+        Candidate candidate;
+        SurfaceSource lastLoggedSource;
+        string lastQueryNote = "No reliable surface at aim. Move slowly and scan.";
         bool previewInitialized;
         int requestVersion;
         string notice;
@@ -54,38 +64,100 @@ namespace Inspection
                 if (touch.phase == TouchPhase.Began && !IsOverUI(touch.position))
                 { AimScreenPoint = touch.position; ResetCandidate(); noticeUntil = 0; }
             }
-            if (IsOverUI(AimScreenPoint) || !TryGetHit(AimScreenPoint, out var hit, out var plane))
+            bool overUI = IsOverUI(AimScreenPoint);
+            if (overUI || !TryGetCandidate(AimScreenPoint, out var current))
             {
                 ResetCandidate();
-                Hint = HasMarker ? "Marker anchored. Aim or tap another tracked surface to reposition." : "No tracked surface. Scan a floor, table or wall; aim inside its boundary.";
+                Hint = DepthStatus + "\n" + (overUI ? "Aim outside the form." : lastQueryNote);
+                if (HasMarker) Hint += " Previous marker retained.";
                 if (Time.unscaledTime < noticeUntil) Hint = notice;
                 return;
             }
-            if (candidatePlane != plane) { stability.Clear(); previewInitialized = false; }
-            candidatePlane = plane;
-            stability.Add(plane.trackableId, hit.pose, Time.unscaledTime);
-            UpdatePreview(hit.pose);
-            Hint = CanConfirm ? "Stable target. Press Place marker to confirm."
+            if (!SameTarget(candidate, current)) { stability.Clear(); previewInitialized = false; }
+            candidate = current;
+            if (lastLoggedSource != current.decision.source)
+            {
+                lastLoggedSource = current.decision.source;
+                Debug.Log("Inspection candidate source: " + lastLoggedSource);
+            }
+            stability.Add(current.key, current.decision.pose, Time.unscaledTime);
+            UpdatePreview(current.decision.pose);
+            string progress = CanConfirm ? "Stable target. Press Place marker to confirm."
                 : "Hold aim still: " + Mathf.RoundToInt(stability.Progress * 100) + "% (position "
                     + (stability.PositionSpread * 100).ToString("F1") + " cm, normal " + stability.NormalSpread.ToString("F1") + " deg).";
+            Hint = SourceLabel(current.decision.source) + " | " + DepthStatus + "\n" + progress;
             if (HasMarker && !CanSubmit) Hint = "Marker tracking limited. Scan the surroundings before submitting.";
             if (Time.unscaledTime < noticeUntil) Hint = notice;
         }
 
-        bool TryGetHit(Vector2 point, out ARRaycastHit hit, out ARPlane plane)
+        string DepthStatus => depth != null ? depth.Status : "Depth unavailable; plane fallback";
+
+        bool TryGetCandidate(Vector2 point, out Candidate selected)
         {
-            hit = default; plane = null;
-            if (!raycasts.Raycast(point, hits, TrackableType.PlaneWithinPolygon)) return false;
-            foreach (var candidate in hits)
+            selected = default;
+            var camera = Camera.main;
+            if (camera == null) { lastQueryNote = "AR camera unavailable."; return false; }
+            ARPlane plane = null;
+            Pose planePose = default, depthPose = default;
+            bool hasPlane = false, hasDepth = false;
+            planeHits.Clear();
+            if (raycasts.Raycast(point, planeHits, TrackableType.PlaneWithinPolygon))
             {
-                var found = planes.GetPlane(candidate.trackableId);
-                if (!ValidPlane(found)) continue;
-                hit = candidate; plane = found; return true;
+                foreach (var hit in planeHits)
+                {
+                    var found = planes.GetPlane(hit.trackableId);
+                    if (!ValidPlane(found) || !SurfaceHitPolicy.IsFinitePose(hit.pose)) continue;
+                    hasPlane = true; plane = found; planePose = FaceCamera(hit.pose, camera.transform.position); break;
+                }
             }
-            return false;
+            // Depth is a standalone source. It is queried even when no ARPlane exists.
+            if (depth != null && depth.IsReady && raycasts.descriptor != null
+                && (raycasts.descriptor.supportedTrackableTypes & TrackableType.Depth) != TrackableType.None)
+            {
+                depthHits.Clear();
+                if (raycasts.Raycast(point, depthHits, TrackableType.Depth))
+                {
+                    foreach (var hit in depthHits)
+                    {
+                        if (!SurfaceHitPolicy.IsUsableDepthPose(hit.pose, camera.transform.position)) continue;
+                        hasDepth = true; depthPose = FaceCamera(hit.pose, camera.transform.position); break;
+                    }
+                }
+            }
+            var decision = SurfaceHitPolicy.Choose(hasPlane, planePose, hasDepth, depthPose, camera.transform.position);
+            if (!decision.IsUsable)
+            {
+                lastQueryNote = decision.source == SurfaceSource.Conflict
+                    ? "Plane/depth disagree. Change viewpoint or avoid the foreground obstruction."
+                    : "No plane or reliable depth at aim. Move slowly and scan.";
+                return false;
+            }
+            selected = new Candidate {
+                decision = decision, plane = decision.source == SurfaceSource.Depth ? null : plane,
+                key = SurfaceHitPolicy.StabilityKey(decision.source, plane != null ? plane.trackableId : default)
+            };
+            return true;
         }
 
         static bool ValidPlane(ARPlane plane) => plane != null && plane.trackingState == TrackingState.Tracking && plane.subsumedBy == null;
+
+        bool CandidateUsable(Candidate value)
+        {
+            if (!value.decision.IsUsable) return false;
+            if (value.decision.source == SurfaceSource.Depth) return depth != null && depth.IsReady;
+            return ValidPlane(value.plane) && (value.decision.source != SurfaceSource.PlaneWithDepth || (depth != null && depth.IsReady));
+        }
+
+        static bool SameTarget(Candidate a, Candidate b) => a.decision.source == b.decision.source && a.key == b.key;
+        static string SourceLabel(SurfaceSource source) => source == SurfaceSource.Depth ? "Depth surface (no plane)"
+            : source == SurfaceSource.PlaneWithDepth ? "Plane + depth checked" : "Plane only";
+
+        static Pose FaceCamera(Pose pose, Vector3 cameraPosition)
+        {
+            if (Vector3.Dot(pose.rotation * Vector3.up, cameraPosition - pose.position) < 0)
+                pose.rotation *= Quaternion.AngleAxis(180, Vector3.forward);
+            return pose;
+        }
 
         void UpdatePreview(Pose pose)
         {
@@ -120,9 +192,9 @@ namespace Inspection
         {
             if (!CanConfirm) { SetNotice("Target not stable yet. Hold aim still until the cursor turns green."); return; }
             // Recheck a real hit at confirmation; never commit the smoothed cursor position.
-            if (!TryGetHit(AimScreenPoint, out var hit, out var plane) || plane != candidatePlane)
+            if (!TryGetCandidate(AimScreenPoint, out var current) || !SameTarget(candidate, current))
             { ResetCandidate(); SetNotice("Target changed. Hold still and try again."); return; }
-            stability.Add(plane.trackableId, hit.pose, Time.unscaledTime);
+            stability.Add(current.key, current.decision.pose, Time.unscaledTime);
             if (!stability.IsReady(Time.unscaledTime)) { SetNotice("Target moved. Wait for green before confirming."); return; }
             IsCreatingAnchor = true;
             int version = ++requestVersion;
@@ -131,16 +203,16 @@ namespace Inspection
             {
                 if (anchors == null || !anchors.enabled || anchors.subsystem == null)
                     throw new InvalidOperationException("Anchor tracking is not available.");
-                if (anchors.descriptor != null && anchors.descriptor.supportsTrackableAttachments)
-                    created = anchors.AttachAnchor(plane, hit.pose);
+                if (current.plane != null && anchors.descriptor != null && anchors.descriptor.supportsTrackableAttachments)
+                    created = anchors.AttachAnchor(current.plane, current.decision.pose);
                 if (created == null)
                 {
-                    var result = await anchors.TryAddAnchorAsync(hit.pose);
+                    var result = await anchors.TryAddAnchorAsync(current.decision.pose);
                     if (result.status.IsSuccess()) created = result.value;
                 }
                 if (created == null) { SetNotice("Anchor creation failed. Scan and try again."); return; }
                 if (this == null || version != requestVersion || !isActiveAndEnabled
-                    || ARSession.state != ARSessionState.SessionTracking || !ValidPlane(plane))
+                    || ARSession.state != ARSessionState.SessionTracking || !CandidateUsable(current))
                 { RemoveAnchor(created); return; }
                 ReleaseMarker();
                 markerAnchor = created;
@@ -148,13 +220,14 @@ namespace Inspection
                 marker.name = "Anchored issue marker";
                 marker.transform.SetParent(created.transform, false);
                 marker.transform.localScale = Vector3.one * .08f;
-                float side = Vector3.Dot(FacingNormal(hit.pose), hit.pose.rotation * Vector3.up) >= 0 ? 1 : -1;
+                float side = Vector3.Dot(FacingNormal(current.decision.pose), current.decision.pose.rotation * Vector3.up) >= 0 ? 1 : -1;
                 marker.transform.localPosition = Vector3.up * (.04f * side);
                 Destroy(marker.GetComponent<Collider>());
                 if (markerMaterial == null)
                 { markerMaterial = new Material(Shader.Find("Unlit/Color")); markerMaterial.color = new Color(1f, .45f, .12f); }
                 marker.GetComponent<Renderer>().sharedMaterial = markerMaterial;
-                SetNotice("Marker anchored. Fill the form and submit; Place marker again to reposition.");
+                Debug.Log("Inspection anchor placed from: " + current.decision.source);
+                SetNotice("Marker anchored (" + SourceLabel(current.decision.source) + "). Fill the form and submit.");
             }
             catch (Exception error)
             {
@@ -179,7 +252,7 @@ namespace Inspection
         void SetNotice(string message) { notice = message; noticeUntil = Time.unscaledTime + 3f; Hint = message; }
         void ResetCandidate()
         {
-            stability.Clear(); candidatePlane = null; previewInitialized = false; PreviewColor = Color.gray;
+            stability.Clear(); candidate = default; previewInitialized = false; PreviewColor = Color.gray;
             if (preview != null) preview.SetActive(false);
         }
         void RemoveAnchor(ARAnchor anchor)

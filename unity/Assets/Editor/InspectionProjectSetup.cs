@@ -37,10 +37,21 @@ public static class InspectionProjectSetup
         if (!XRPackageMetadataStore.AssignLoader(manager, "UnityEngine.XR.ARCore.ARCoreLoader", BuildTargetGroup.Android))
             throw new BuildFailedException("Could not enable ARCore. Wait for Package Manager to finish, then configure again.");
 
+        var arcore = AssetDatabase.LoadAssetAtPath<UnityEditor.XR.ARCore.ARCoreSettings>("Assets/XR/Settings/ARCoreSettings.asset");
+        if (arcore == null)
+        {
+            arcore = ScriptableObject.CreateInstance<UnityEditor.XR.ARCore.ARCoreSettings>();
+            AssetDatabase.CreateAsset(arcore, "Assets/XR/Settings/ARCoreSettings.asset");
+        }
+        arcore.requirement = UnityEditor.XR.ARCore.ARCoreSettings.Requirement.Required;
+        arcore.depth = UnityEditor.XR.ARCore.ARCoreSettings.Requirement.Optional;
+        UnityEditor.XR.ARCore.ARCoreSettings.currentSettings = arcore;
+        EditorUtility.SetDirty(arcore);
+
         PlayerSettings.companyName = "InspectionDemo";
         PlayerSettings.productName = "AR Inspection";
-        PlayerSettings.bundleVersion = "1.2.1";
-        PlayerSettings.Android.bundleVersionCode = 4;
+        PlayerSettings.bundleVersion = "1.3";
+        PlayerSettings.Android.bundleVersionCode = 5;
         PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.Android, "com.inspection.prototype");
         PlayerSettings.SetScriptingBackend(NamedBuildTarget.Android, ScriptingImplementation.IL2CPP);
         PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARM64;
@@ -63,7 +74,7 @@ public static class InspectionProjectSetup
         EditorUtility.SetDirty(settings.SettingsForBuildTarget(BuildTargetGroup.Android));
         EditorUtility.SetDirty(manager);
         AssetDatabase.SaveAssets();
-        Debug.Log("Android configured: ARCore, ARM64, IL2CPP, GLES3, HTTP. Switch build platform to Android and build.");
+        Debug.Log("Android configured: ARCore, optional Depth, ARM64, IL2CPP, GLES3, HTTP.");
     }
 
     static void IncludeRuntimeShaders()
@@ -112,6 +123,7 @@ public static class InspectionProjectSetup
     public static void BuildAndroid()
     {
         InspectionStabilityChecks.Run();
+        InspectionDepthChecks.Run();
         Configure();
         if (!EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.Android, BuildTarget.Android))
             throw new BuildFailedException("Install Android Build Support (SDK, NDK, OpenJDK) through Unity Hub.");
